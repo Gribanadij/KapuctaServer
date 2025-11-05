@@ -38,4 +38,4 @@
 💻 **Backend-разработчик:** [mdpka](https://t.me/mdpkaaa)  
 🎨 **Frontend-разработчик:** [10i](https://t.me/neprikayaniy)  
 👾 **Наш сквад:** [KAPUCTA squad](https://t.me/KAPUCTA_SQUAD_10I)  
-💾 **Репозиторий сервера:** [KapuctaServer](https://github.com/mdpka-flp/KapuctaServer)
+💾 **Репозиторий мессенджера:** [KapuctaServer](https://github.com/mdpka-flp/Kapuctagram)
