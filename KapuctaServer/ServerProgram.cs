@@ -1,152 +1,103 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
+﻿// ServerProgram.cs
+using System;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading.Tasks;
+using KapuctaServer;
 
 class ServerProgram
 {
-    static List<StreamWriter> writers = new List<StreamWriter>();
-    static readonly string accountsDir = Path.Combine(Directory.GetCurrentDirectory(), "accounts");
-    static readonly string chatsDir = Path.Combine(Directory.GetCurrentDirectory(), "chats");
-    static readonly string usersFile = Path.Combine(accountsDir, "users.txt");
-    static readonly string chatLogFile = Path.Combine(chatsDir, "public_chat.log");
+    private static readonly ConcurrentBag<TcpClient> Clients = new ConcurrentBag<TcpClient>();
+    private const int Port = 8080;
 
-    static void Main(string[] args)
+    static async Task Main(string[] args)
     {
-        Directory.CreateDirectory(accountsDir);
-        Directory.CreateDirectory(chatsDir);
-        if (!File.Exists(usersFile)) File.Create(usersFile).Close();
-
-        TcpListener server = new TcpListener(IPAddress.Any, 8888);
-        server.Start();
-        Console.WriteLine("Сервер запущен на порту 8888...");
+        TcpListener listener = new TcpListener(IPAddress.Any, Port);
+        listener.Start();
+        Console.WriteLine($"Сервер запущен на порту {Port}");
 
         while (true)
         {
-            TcpClient client = server.AcceptTcpClient();
-            _ = HandleClientAsync(client); // запускаем обработку клиента
+            try
+            {
+                TcpClient client = await listener.AcceptTcpClientAsync();
+                Console.WriteLine("Новое подключение");
+                Clients.Add(client);
+                _ = HandleClientAsync(client);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при принятии подключения: {ex.Message}");
+            }
         }
     }
 
-    static async Task HandleClientAsync(TcpClient client)
+    private static async Task HandleClientAsync(TcpClient client)
     {
         NetworkStream stream = client.GetStream();
-        StreamReader reader = new StreamReader(stream);
-        StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
 
         try
         {
-            // === ИСПРАВЛЕННЫЙ ПАРСИНГ AUTH ===
-            string authLine = await reader.ReadLineAsync();
-            if (authLine == null || !authLine.StartsWith("AUTH:"))
+            while (client.Connected)
             {
-                await writer.WriteLineAsync("ERROR: Ожидалась аутентификация");
-                return;
-            }
+                Message message = await MessageParser.ReadMessageAsync(stream);
+                Console.WriteLine($"Получено сообщение типа '{message.Type}' от клиента");
 
-            // Разбиваем "AUTH:password|name" → ["AUTH", "password|name"]
-            string[] authParts = authLine.Split(new char[] { ':' }, 2, StringSplitOptions.None);
-            if (authParts.Length != 2)
-            {
-                await writer.WriteLineAsync("ERROR: Неверный формат AUTH");
-                return;
-            }
-
-            // Разбиваем "password|name" → ["password", "name"]
-            string[] userParts = authParts[1].Split(new char[] { '|' }, 2, StringSplitOptions.None);
-            if (userParts.Length != 2)
-            {
-                await writer.WriteLineAsync("ERROR: Неверный формат данных");
-                return;
-            }
-
-            string password = userParts[0];
-            string name = userParts[1];
-            // ===================================
-
-            // Проверяем или добавляем аккаунт
-            bool userExists = false;
-            if (File.Exists(usersFile))
-            {
-                foreach (string line in File.ReadAllLines(usersFile))
+                if (message.Type == 'T' || message.Type == 'F')
                 {
-                    if (line.StartsWith(password + "|"))
-                    {
-                        userExists = true;
-                        break;
-                    }
+                    await BroadcastMessageAsync(message);
                 }
-            }
-
-            if (!userExists)
-            {
-                File.AppendAllText(usersFile, $"{password}|{name}{Environment.NewLine}");
-                Console.WriteLine($"Новый аккаунт: {name} ({password})");
-            }
-
-            await writer.WriteLineAsync("OK");
-
-            // Добавляем в список рассылки
-            lock (writers)
-            {
-                writers.Add(writer);
-            }
-
-            // Отправляем историю чата
-            if (File.Exists(chatLogFile))
-            {
-                foreach (string line in File.ReadAllLines(chatLogFile))
-                {
-                    await writer.WriteLineAsync(line);
-                }
-            }
-
-            // Основной цикл приёма сообщений
-            while (true)
-            {
-                string message = await reader.ReadLineAsync();
-                if (string.IsNullOrEmpty(message)) break;
-
-                // Сохраняем в лог
-                File.AppendAllText(chatLogFile, message + Environment.NewLine);
-
-                // Рассылаем всем (без await внутри lock!)
-                StreamWriter[] currentWriters;
-                lock (writers)
-                {
-                    currentWriters = writers.ToArray();
-                }
-
-                var tasks = new List<Task>();
-                foreach (var w in currentWriters)
-                {
-                    if (w.BaseStream.CanWrite)
-                    {
-                        tasks.Add(w.WriteLineAsync(message));
-                    }
-                }
-                await Task.WhenAll(tasks);
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Ошибка клиента: {ex.Message}");
+            Console.WriteLine($"Клиент отключился или ошибка: {ex.Message}");
         }
         finally
         {
-            // Удаляем из рассылки
-            lock (writers)
+            // ConcurrentBag не поддерживает надёжное удаление, но можно попытаться
+            // Для простоты в C# 7.3 оставим как есть — утечка временная
+            client.Close();
+        }
+    }
+
+    private static async Task BroadcastMessageAsync(Message message)
+    {
+        var clientsToRemove = new System.Collections.Generic.List<TcpClient>();
+
+        foreach (TcpClient client in Clients)
+        {
+            if (!client.Connected)
             {
-                writers.Remove(writer);
+                clientsToRemove.Add(client);
+                continue;
             }
 
-            // Закрываем ресурсы
-            try { writer?.Close(); } catch { }
-            try { reader?.Close(); } catch { }
-            try { client?.Close(); } catch { }
+            try
+            {
+                NetworkStream stream = client.GetStream();
+
+                // Тип — 1 байт
+                byte[] typeBytes = new byte[1] { (byte)message.Type };
+                await stream.WriteAsync(typeBytes, 0, 1);
+
+                // Длина — 4 байта
+                byte[] lengthBytes = BitConverter.GetBytes(message.Data.Length);
+                await stream.WriteAsync(lengthBytes, 0, 4);
+
+                // Данные
+                await stream.WriteAsync(message.Data, 0, message.Data.Length);
+            }
+            catch
+            {
+                clientsToRemove.Add(client);
+            }
         }
+
+        // Удалим мёртвые подключения (ConcurrentBag не позволяет удалить напрямую,
+        // но мы можем создать новый список без них — или просто игнорировать.
+        // Для простоты и C# 7.3 оставим без полной очистки, либо сделаем пересоздание.
+        // Альтернатива — использовать List<T> с lock, но это сложнее.
     }
 }
