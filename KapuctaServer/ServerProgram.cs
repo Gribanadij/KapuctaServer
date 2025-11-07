@@ -56,6 +56,29 @@ class ServerProgram
     private static readonly string UsersFile = "users.txt";
     private static readonly object FileLock = new object();
 
+    private static int GetNextUserId()
+    {
+        lock (FileLock)
+        {
+            if (!File.Exists(UsersFile))
+                return 1;
+
+            var users = File.ReadAllLines(UsersFile);
+            int maxId = 0;
+
+            foreach (var userLine in users)
+            {
+                var parts = userLine.Split(new string[] { " | " }, StringSplitOptions.None);
+                if (parts.Length >= 3 && int.TryParse(parts[1], out int userId))
+                {
+                    if (userId > maxId) maxId = userId;
+                }
+            }
+
+            return maxId + 1;
+        }
+    }
+
     static ServerProgram()
     {
         if (!File.Exists(UsersFile))
@@ -98,7 +121,7 @@ class ServerProgram
                 return;
             }
 
-            string authData = Encoding.UTF8.GetString(authMessage.Data); // ✅ Data, а не Text
+            string authData = Encoding.UTF8.GetString(authMessage.Data);
             string[] parts = authData.Split(new string[] { " | " }, StringSplitOptions.None);
             if (parts.Length != 2)
             {
@@ -125,20 +148,35 @@ class ServerProgram
             {
                 var users = File.ReadAllLines(UsersFile);
                 var existing = users.FirstOrDefault(u => u.StartsWith(password + " | "));
+
                 if (existing != null)
                 {
+                    // Пользователь существует - получаем его данные
                     var userParts = existing.Split(new string[] { " | " }, StringSplitOptions.None);
-                    finalName = userParts[1];
-                    userId = Math.Abs(password.GetHashCode()).ToString();
-                    Console.WriteLine($"Вход: {finalName} ({userId})");
+                    if (userParts.Length >= 3)
+                    {
+                        userId = userParts[1];
+                        finalName = userParts[2];
+                    }
+                    else
+                    {
+                        // Миграция со старого формата
+                        userId = GetNextUserId().ToString("D5");
+                        finalName = userParts[1];
+                        // Обновляем запись
+                        var updatedUsers = users.Select(u => u == existing ? $"{password} | {userId} | {finalName}" : u).ToArray();
+                        File.WriteAllLines(UsersFile, updatedUsers);
+                    }
+                    Console.WriteLine($"Вход: {finalName} (ID: {userId})");
                 }
                 else
                 {
+                    // Новый пользователь
+                    userId = GetNextUserId().ToString("D5");
                     finalName = requestedName;
-                    userId = Math.Abs(password.GetHashCode()).ToString();
-                    string newRecord = $"{password} | {finalName}";
+                    string newRecord = $"{password} | {userId} | {finalName}";
                     File.AppendAllLines(UsersFile, new[] { newRecord });
-                    Console.WriteLine($"Регистрация: {finalName} ({userId})");
+                    Console.WriteLine($"Регистрация: {finalName} (ID: {userId})");
                 }
             }
 
@@ -189,12 +227,15 @@ class ServerProgram
             {
                 if (message.Type == 'T')
                 {
-                    string textWithSender = $"[{sender.Name}]: {Encoding.UTF8.GetString(message.Data)}"; // ✅
+                    // Формат: "Имя: текст"
+                    string textWithSender = $"{sender.Name}: {Encoding.UTF8.GetString(message.Data)}";
                     await SendMessageAsync(client, 'T', textWithSender);
                 }
                 else if (message.Type == 'F')
                 {
-                    await SendMessageAsync(client, 'F', Encoding.UTF8.GetString(message.Data)); // ✅
+                    // Формат: "Имя отправил файл: имя_файла"
+                    string fileWithSender = $"{sender.Name} отправил файл: {Encoding.UTF8.GetString(message.Data)}";
+                    await SendMessageAsync(client, 'F', fileWithSender);
                 }
             }
             catch
