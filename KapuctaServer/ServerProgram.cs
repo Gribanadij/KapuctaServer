@@ -8,14 +8,12 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
-// === ОПРЕДЕЛЯЕМ СВОЙ Message ===
 public class Message
 {
     public char Type { get; set; }
     public byte[] Data { get; set; }
 }
 
-// === ПАРСЕР (перенесён из MessageParser.cs для надёжности) ===
 public static class MessageParser
 {
     public static async Task<Message> ReadMessageAsync(NetworkStream stream)
@@ -48,13 +46,16 @@ public static class MessageParser
     }
 }
 
-// === СЕРВЕР ===
 class ServerProgram
 {
     private static readonly ConcurrentBag<TcpClient> Clients = new ConcurrentBag<TcpClient>();
     private const int Port = 1337;
     private static readonly string UsersFile = "users.txt";
     private static readonly object FileLock = new object();
+
+    private static readonly string FilesDir = "Files";
+    private static int _nextFileId = 1;
+    private static readonly object FileIdLock = new object();
 
     private static int GetNextUserId()
     {
@@ -83,6 +84,21 @@ class ServerProgram
     {
         if (!File.Exists(UsersFile))
             File.Create(UsersFile).Close();
+
+        if (!Directory.Exists(FilesDir))
+            Directory.CreateDirectory(FilesDir);
+
+        if (Directory.Exists(FilesDir))
+        {
+            var dirs = Directory.GetDirectories(FilesDir);
+            foreach (var dir in dirs)
+            {
+                if (int.TryParse(Path.GetFileName(dir), out int id) && id >= _nextFileId)
+                {
+                    _nextFileId = id + 1;
+                }
+            }
+        }
     }
 
     static async Task Main(string[] args)
@@ -151,7 +167,6 @@ class ServerProgram
 
                 if (existing != null)
                 {
-                    // Пользователь существует - получаем его данные
                     var userParts = existing.Split(new string[] { " | " }, StringSplitOptions.None);
                     if (userParts.Length >= 3)
                     {
@@ -160,10 +175,8 @@ class ServerProgram
                     }
                     else
                     {
-                        // Миграция со старого формата
                         userId = GetNextUserId().ToString("D5");
                         finalName = userParts[1];
-                        // Обновляем запись
                         var updatedUsers = users.Select(u => u == existing ? $"{password} | {userId} | {finalName}" : u).ToArray();
                         File.WriteAllLines(UsersFile, updatedUsers);
                     }
@@ -171,7 +184,6 @@ class ServerProgram
                 }
                 else
                 {
-                    // Новый пользователь
                     userId = GetNextUserId().ToString("D5");
                     finalName = requestedName;
                     string newRecord = $"{password} | {userId} | {finalName}";
@@ -189,11 +201,31 @@ class ServerProgram
             while (client.Connected)
             {
                 var message = await MessageParser.ReadMessageAsync(stream);
-                Console.WriteLine($"Сообщение от {session.Name}: {Encoding.UTF8.GetString(message.Data)}");
 
-                if (message.Type == 'T' || message.Type == 'F')
+                if (message.Type == 'T')
                 {
+                    Console.WriteLine($"💬 Сообщение от {session.Name}: {Encoding.UTF8.GetString(message.Data)}");
                     await BroadcastMessageAsync(message, session);
+                }
+                else if (message.Type == 'F')
+                {
+                    string fileMetadata = Encoding.UTF8.GetString(message.Data);
+                    string[] fileParts = fileMetadata.Split('|');
+
+                    if (fileParts.Length == 2 && long.TryParse(fileParts[1], out long fileSize))
+                    {
+                        string fileName = fileParts[0];
+                        Console.WriteLine($"📥 Файл от {session.Name}: {fileName} ({fileSize} bytes)");
+
+                        int fileId = await SaveFileAsync(stream, fileName, fileSize, session);
+
+                        string fileNotification = $"{session.Name} отправил файл: {fileName} (ID: {fileId})";
+                        await BroadcastMessageAsync(new Message
+                        {
+                            Type = 'F',
+                            Data = Encoding.UTF8.GetBytes(fileNotification)
+                        }, session);
+                    }
                 }
             }
         }
@@ -227,13 +259,11 @@ class ServerProgram
             {
                 if (message.Type == 'T')
                 {
-                    // Формат: "Имя: текст"
                     string textWithSender = $"{sender.Name}: {Encoding.UTF8.GetString(message.Data)}";
                     await SendMessageAsync(client, 'T', textWithSender);
                 }
                 else if (message.Type == 'F')
                 {
-                    // Формат: "Имя отправил файл: имя_файла"
                     string fileWithSender = $"{sender.Name} отправил файл: {Encoding.UTF8.GetString(message.Data)}";
                     await SendMessageAsync(client, 'F', fileWithSender);
                 }
@@ -256,6 +286,52 @@ class ServerProgram
         await stream.WriteAsync(BitConverter.GetBytes(dataBytes.Length), 0, 4);
         await stream.WriteAsync(dataBytes, 0, dataBytes.Length);
         await stream.FlushAsync();
+    }
+
+    private static async Task<int> SaveFileAsync(NetworkStream stream, string fileName, long fileSize, UserSession sender)
+    {
+        int fileId;
+        string fileDir, filePath;
+
+        lock (FileIdLock)
+        {
+            fileId = _nextFileId++;
+            fileDir = Path.Combine(FilesDir, fileId.ToString());
+            Directory.CreateDirectory(fileDir);
+            filePath = Path.Combine(fileDir, fileName);
+        }
+
+        Console.WriteLine($"💾 Сохранение файла: {fileName} ({fileSize} bytes) как ID {fileId}");
+
+        using (var fileStream = File.Create(filePath))
+        {
+            byte[] buffer = new byte[64 * 1024];
+            long totalRead = 0;
+
+            while (totalRead < fileSize)
+            {
+                int toRead = (int)Math.Min(buffer.Length, fileSize - totalRead);
+                int read = await stream.ReadAsync(buffer, 0, toRead);
+                if (read == 0)
+                    throw new EndOfStreamException("Соединение прервано при передаче файла");
+
+                await fileStream.WriteAsync(buffer, 0, read);
+                totalRead += read;
+
+                double progress = (double)totalRead / fileSize * 100;
+                Console.Write($"\r💾 Прогресс: [{GetProgressBar(progress)}] {progress:F1}%");
+            }
+            Console.WriteLine();
+        }
+
+        return fileId;
+    }
+
+    private static string GetProgressBar(double percentage)
+    {
+        int width = 20;
+        int progressWidth = (int)(percentage / 100 * width);
+        return new string('#', progressWidth) + new string('-', width - progressWidth);
     }
 }
 
